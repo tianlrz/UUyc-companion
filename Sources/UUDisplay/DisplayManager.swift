@@ -52,17 +52,37 @@ final class DisplayManager {
     private let restoreLayout: ([CGDirectDisplayID: CGPoint]) -> CGError
     private let uptime: () -> TimeInterval
     private var layoutStability = DisplayLayoutStability()
+    private let powerPhase: (DisplayRecoveryPowerGuard.Phase) -> Void
+    private let canWriteLayout: () -> Bool
+    private var remoteConnected = false
+    private(set) var waitingForDisplayWake = false
     private(set) var retryingLayout = false
 
     // 只替换布局恢复的 I/O，测试无需连接 UU、建虚拟屏或修改真实显示器。
-    init(markerURL: URL = ConfigStore.dir.appendingPathComponent("session.json"),
+    init(powerPhase: @escaping (DisplayRecoveryPowerGuard.Phase) -> Void = { DisplayRecoveryPowerGuard.shared.setPhase($0) },
+         canWriteLayout: @escaping () -> Bool = { DisplayManager.displaysAreAwake() },
+         markerURL: URL = ConfigStore.dir.appendingPathComponent("session.json"),
          layoutSnapshot: @escaping () -> [CGDirectDisplayID: CGRect]? = { DisplayManager.readLayout() },
          restoreLayout: @escaping ([CGDirectDisplayID: CGPoint]) -> CGError = { DisplayManager.restoreOrigins($0) },
          uptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        self.powerPhase = powerPhase
+        self.canWriteLayout = canWriteLayout
         self.markerURL = markerURL
         self.layoutSnapshot = layoutSnapshot
         self.restoreLayout = restoreLayout
         self.uptime = uptime
+    }
+
+    func setRemoteConnected(_ connected: Bool) {
+        remoteConnected = connected
+        updatePowerGuard()
+    }
+
+    private func updatePowerGuard() {
+        if remoteConnected { powerPhase(.connected) }
+        else if (!wedged || retryingLayout) && !waitingForDisplayWake && (vd != nil || !retiring.isEmpty || !broken.isEmpty || physicalOff || !savedOrigins.isEmpty) {
+            powerPhase(.restoring)
+        } else { powerPhase(.inactive) }
     }
 
     var isActive: Bool { vd != nil }
@@ -85,7 +105,14 @@ final class DisplayManager {
     }
 
     /// 连入（包括设备名尚未读到）时取消等待中的重试；已提交的事务会完成。
-    func cancelLayoutRetry() { retryingLayout = false }
+    func cancelLayoutRetry() {
+        if retryingLayout {
+            waitingForDisplayWake = false
+            layoutStability.reset()
+        }
+        retryingLayout = false
+        updatePowerGuard()
+    }
 
     static func onlineDisplays() -> [CGDirectDisplayID] {
         var count: UInt32 = 0
@@ -183,11 +210,60 @@ final class DisplayManager {
         wedged = true
         let reason = err.map { "显示配置失败（CGError=\($0.rawValue)）" } ?? "显示器布局尚未稳定"
         Log.info("⛔️ \(reason)，已暂停自动调整；断开远程后可重试布局还原，或完全退出并重开伴侣；仍失败再考虑注销或重启 Mac")
+        updatePowerGuard()
         onChange?()
     }
 
+    private func layoutAlreadyMatches(_ layout: [CGDirectDisplayID: CGRect]?) -> Bool {
+        guard let layout else { return false }
+        let targets = savedOrigins.filter { layout[$0.key] != nil }
+        return !targets.isEmpty && targets.allSatisfy { layout[$0.key]?.origin == $0.value }
+    }
+
+    private func finishLayoutRestore() {
+        savedOrigins = [:]
+        try? FileManager.default.removeItem(at: markerURL)
+        if retryingLayout {
+            wedged = false
+            Log.info("✅ 布局还原成功，已恢复自动屏幕调整")
+        }
+        retryingLayout = false
+        waitingForDisplayWake = false
+        updatePowerGuard()
+        onChange?()
+    }
+
+    private func waitForDisplayWake() {
+        if !waitingForDisplayWake {
+            Log.info("屏幕已休眠，暂不提交布局配置；保留恢复记录，唤醒后继续")
+        }
+        waitingForDisplayWake = true
+        layoutStability.reset()
+        updatePowerGuard()
+        onChange?()
+        if let done = shutdownCompletion {
+            shutdownCompletion = nil
+            done()
+            return
+        }
+        busy = true
+        finish(settle: 1)
+    }
+
     private func restorePendingLayout() {
-        switch layoutStability.observe(layoutSnapshot(), now: uptime()) {
+        let snapshot = layoutSnapshot()
+        // 无需改布局时，睡眠中也可以只读确认；不提交任何显示事务。
+        if !canWriteLayout() && !layoutAlreadyMatches(snapshot) {
+            return waitForDisplayWake()
+        }
+        if waitingForDisplayWake {
+            waitingForDisplayWake = false
+            layoutStability.reset()
+            updatePowerGuard()
+            Log.info("屏幕可配置，重新等待布局稳定后继续还原")
+            onChange?()
+        }
+        switch layoutStability.observe(snapshot, now: uptime()) {
         case .wait:
             busy = true
             return finish(settle: 0.5)
@@ -195,30 +271,41 @@ final class DisplayManager {
             retryingLayout = false
             Log.info("⚠️ 等待显示器布局稳定超时，保留布局记录并暂停自动调整")
             enterWedged()
-            // 让退出收尾能完成；不自动重试失败的恢复。
             busy = true
             return finish(settle: 0)
         case .ready:
+            if layoutAlreadyMatches(snapshot) {
+                Log.info("✅ 显示器布局已匹配，跳过重配置事务")
+                finishLayoutRestore()
+                busy = true
+                return finish(settle: 0.5)
+            }
             let origins = savedOrigins
             let restore = restoreLayout
-            runCG(settle: 0.5, completion: { [self] err in
-                layoutStability.reset()
-                if err == .success {
-                    savedOrigins = [:]
-                    try? FileManager.default.removeItem(at: markerURL)
-                    // 只有用户请求的布局还原成功才解除保护；重连取消后仍保持保护。
-                    if retryingLayout {
-                        wedged = false
-                        Log.info("✅ 布局还原成功，已恢复自动屏幕调整")
+            let ready = canWriteLayout
+            busy = true
+            cgQueue.async {
+                // 二次检查，覆盖主线程观察稳定后、后台事务提交前的睡眠窗口。
+                let result: CGError? = ready() ? restore(origins) : nil
+                DispatchQueue.main.async { [self] in
+                    layoutStability.reset()
+                    if let err = result {
+                        if err == .success {
+                            finishLayoutRestore()
+                        } else {
+                            Log.info("⚠️ 布局还原失败 CGError=\(err.rawValue)，保留恢复记录；不自动重试")
+                            retryingLayout = false
+                            enterWedged(err)
+                            updatePowerGuard()
+                        }
+                        finish(settle: 0.5)
+                    } else {
+                        busy = false
+                        waitForDisplayWake()
                     }
-                } else {
-                    // 所有失败均保留内存与磁盘记录，避免非超时错误无限循环。
-                    Log.info("⚠️ 布局还原失败 CGError=\(err.rawValue)，保留恢复记录；不自动重试")
-                    enterWedged(err)
+                    onChange?()
                 }
-                retryingLayout = false
-                onChange?()
-            }) { restore(origins) }
+            }
         }
     }
 
@@ -237,6 +324,7 @@ final class DisplayManager {
 
     private func step() {
         guard !busy else { return }
+        updatePowerGuard()
         if wedged {
             // 保护状态：保留物理屏兜底；仅允许用户发起的布局还原，不再增删虚拟屏。
             if physicalOff { return runCG(settle: 3) { PhysicalDisplays.restore(reason: "保护状态") ? .success : .failure } }
@@ -412,6 +500,11 @@ final class DisplayManager {
         if err != .success { CGCancelDisplayConfiguration(cfg) }
         Log.info(err == .success ? "✅ 已还原显示器布局" : "⚠️ 还原布局 CGError=\(err.rawValue)")
         return err
+    }
+
+    private static func displaysAreAwake() -> Bool {
+        let physical = onlineDisplays().filter { !isVirtual($0) }
+        return !physical.isEmpty && physical.allSatisfy { CGDisplayIsAsleep($0) == 0 }
     }
 
     private static func readLayout() -> [CGDirectDisplayID: CGRect]? {

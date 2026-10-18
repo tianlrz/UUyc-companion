@@ -35,6 +35,7 @@ final class Coordinator {
     }
 
     var statusText: String {
+        if display.waitingForDisplayWake { return "屏幕休眠中，唤醒后继续还原布局" }
         if display.wedged {
             if display.retryingLayout { return "正在重试还原显示器布局…" }
             return canRetryLayout ? "⚠️ 屏幕设置已暂停，可重试布局还原"
@@ -52,6 +53,7 @@ final class Coordinator {
     // MARK: - 事件
 
     func handleConnect() {
+        display.setRemoteConnected(true)
         display.cancelLayoutRetry()
         connectedAt = Date()
         controllerName = nil
@@ -67,6 +69,7 @@ final class Coordinator {
     }
 
     func handleDisconnect() {
+        display.setRemoteConnected(false)
         namePoll?.invalidate()
         namePoll = nil
         display.remove()
@@ -176,6 +179,7 @@ final class Coordinator {
     }
 
     func shutdown(completion: @escaping () -> Void) {
+        display.setRemoteConnected(false)
         display.remove(completion: completion)
     }
 }

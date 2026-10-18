@@ -57,7 +57,7 @@ func applyDisplayConfig(_ body: (CGDisplayConfigRef?) -> Void) -> CGError {
         var now: TimeInterval = 0
         var attempts = 0
         var notifications = 0
-        let manager = DisplayManager(markerURL: url, layoutSnapshot: { layout }, restoreLayout: { saved in
+        let manager = DisplayManager(powerPhase: { _ in }, canWriteLayout: { true }, markerURL: url, layoutSnapshot: { layout }, restoreLayout: { saved in
             precondition(!Thread.isMainThread, "CoreGraphics work must stay off main")
             precondition(saved == origins, "original layout was lost")
             attempts += 1
@@ -88,7 +88,7 @@ func applyDisplayConfig(_ body: (CGDisplayConfigRef?) -> Void) -> CGError {
         try marker.write(to: url)
         var failures = 0
         now = 10
-        let failed = DisplayManager(markerURL: url, layoutSnapshot: { layout }, restoreLayout: { _ in
+        let failed = DisplayManager(powerPhase: { _ in }, canWriteLayout: { true }, markerURL: url, layoutSnapshot: { layout }, restoreLayout: { _ in
             failures += 1
             return .illegalArgument
         }, uptime: { now })
@@ -117,7 +117,7 @@ func applyDisplayConfig(_ body: (CGDisplayConfigRef?) -> Void) -> CGError {
 
         // 模拟重开：从保留的磁盘记录继续收尾，成功后才删除。
         now = 30
-        let restarted = DisplayManager(markerURL: url, layoutSnapshot: { layout }, restoreLayout: { saved in
+        let restarted = DisplayManager(powerPhase: { _ in }, canWriteLayout: { true }, markerURL: url, layoutSnapshot: { layout }, restoreLayout: { saved in
             precondition(saved == origins)
             return .success
         }, uptime: { now })
@@ -130,7 +130,7 @@ func applyDisplayConfig(_ body: (CGDisplayConfigRef?) -> Void) -> CGError {
         // 始终读不到有效布局：不发起事务、不丢记录，仍能退出。
         try marker.write(to: url)
         now = 40
-        let unstable = DisplayManager(markerURL: url, layoutSnapshot: { nil }, restoreLayout: { _ in
+        let unstable = DisplayManager(powerPhase: { _ in }, canWriteLayout: { true }, markerURL: url, layoutSnapshot: { nil }, restoreLayout: { _ in
             preconditionFailure("must not restore an unstable layout")
         }, uptime: { now })
         unstable.recoverIfNeeded()
@@ -140,6 +140,108 @@ func applyDisplayConfig(_ body: (CGDisplayConfigRef?) -> Void) -> CGError {
         var finished = false
         unstable.remove { finished = true }
         precondition(finished)
+        // 已经匹配的布局：即使睡眠中也只读确认，禁止提交无效重配置。
+        try marker.write(to: url)
+        now = 100
+        let matching: [CGDirectDisplayID: CGRect] = [1: CGRect(x: 100, y: 200, width: 1920, height: 1080)]
+        let noOp = DisplayManager(powerPhase: { _ in }, canWriteLayout: { false },
+            markerURL: url, layoutSnapshot: { matching }, restoreLayout: { _ in
+                preconditionFailure("matching layout must not submit a transaction")
+            }, uptime: { now })
+        noOp.recoverIfNeeded()
+        now = 103
+        waitUntil { !FileManager.default.fileExists(atPath: url.path) }
+        precondition(!noOp.wedged && !noOp.waitingForDisplayWake)
+        pump()
+
+        // 睡眠时间不计入稳定等待超时；唤醒后重新计时，只执行一次还原。
+        try marker.write(to: url)
+        now = 200
+        var awake = false
+        var sleepAttempts = 0
+        var phases: [DisplayRecoveryPowerGuard.Phase] = []
+        let sleeping = DisplayManager(powerPhase: { phases.append($0) }, canWriteLayout: { awake },
+            markerURL: url, layoutSnapshot: { layout }, restoreLayout: { saved in
+                precondition(saved == origins)
+                sleepAttempts += 1
+                return .success
+            }, uptime: { now })
+        sleeping.recoverIfNeeded()
+        precondition(sleeping.waitingForDisplayWake && !sleeping.wedged)
+        precondition(phases.last == .inactive, "sleep deferral must release the wake hold")
+        now = 800
+        pump(1.1)
+        precondition(sleepAttempts == 0 && !sleeping.wedged && FileManager.default.fileExists(atPath: url.path))
+        awake = true
+        waitUntil { !sleeping.waitingForDisplayWake }
+        precondition(sleepAttempts == 0, "wake must start a new stable window")
+        now = 803
+        waitUntil { !FileManager.default.fileExists(atPath: url.path) }
+        precondition(sleepAttempts == 1 && !sleeping.wedged && phases.last == .inactive)
+        pump()
+
+        // 屏幕休眠时退出不等待用户唤醒，不提交事务，仍保留恢复记录。
+        try marker.write(to: url)
+        now = 850
+        let exitSleeping = DisplayManager(powerPhase: { _ in }, canWriteLayout: { false },
+            markerURL: url, layoutSnapshot: { layout }, restoreLayout: { _ in
+                preconditionFailure("shutdown during sleep must not configure displays")
+            }, uptime: { now })
+        exitSleeping.recoverIfNeeded()
+        var sleepShutdownFinished = false
+        exitSleeping.remove { sleepShutdownFinished = true }
+        waitUntil { sleepShutdownFinished }
+        precondition(FileManager.default.fileExists(atPath: url.path) && !exitSleeping.wedged)
+
+        // 后台提交前再次发现睡眠：仍不提交、不中断记录、不进入保护。
+        try marker.write(to: url)
+        now = 900
+        let beforeSubmit = DisplayManager(powerPhase: { _ in },
+            canWriteLayout: { Thread.isMainThread }, markerURL: url,
+            layoutSnapshot: { layout }, restoreLayout: { _ in
+                preconditionFailure("sleep between readiness and submission must defer")
+            }, uptime: { now })
+        beforeSubmit.recoverIfNeeded()
+        now = 903
+        waitUntil { beforeSubmit.waitingForDisplayWake }
+        precondition(!beforeSubmit.wedged && FileManager.default.fileExists(atPath: url.path))
+
+        // 防休眠请求先取得再释放旧请求，收尾不重复续租，结束及时释放。
+        var powerEvents: [String] = []
+        var nextID: UInt32 = 0
+        var failLease = false
+        var power: DisplayRecoveryPowerGuard? = DisplayRecoveryPowerGuard(
+            lease: 45, renewalInterval: 0.05, create: { timeout in
+                precondition(timeout == 45)
+                if failLease { powerEvents.append("failed"); return nil }
+                nextID += 1
+                powerEvents.append("create \(nextID)")
+                return nextID
+            }, release: { powerEvents.append("release \($0)") })
+        power!.setPhase(.connected)
+        precondition(powerEvents == ["create 1"])
+        power!.setPhase(.connected)
+        precondition(nextID == 1)
+        pump(0.12)
+        precondition(nextID >= 2, "connected session must renew the bounded lease")
+        power!.setPhase(.restoring)
+        let handoffID = nextID
+        let countAtHandoff = powerEvents.count
+        precondition(powerEvents.suffix(2) == ["create \(handoffID)", "release \(handoffID - 1)"])
+        pump(0.12)
+        precondition(powerEvents.count == countAtHandoff, "teardown must not renew indefinitely")
+        power!.setPhase(.inactive)
+        precondition(powerEvents.last == "release \(handoffID)")
+        power!.setPhase(.connected)
+        let heldID = nextID
+        failLease = true
+        pump(0.07)
+        precondition(powerEvents.last == "failed")
+        precondition(!powerEvents.contains("release \(heldID)"), "failed renewal must keep the previous lease")
+        power = nil
+        precondition(powerEvents.last == "release \(heldID)", "deinit must release the live lease")
+
+        print("PASS: sleep deferral and wake recovery; matching-layout no-op; worker sleep recheck; bounded power handoff and release")
         print("PASS: stable-window gate; failed journal retained; bounded manual retry; protection until success; reconnect cancellation; shutdown; restart recovery; unstable-layout timeout")
     }
 }

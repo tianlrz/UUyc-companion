@@ -12,6 +12,6 @@ module CGVirtualDisplayBridge {
 }
 MODULE
 swiftc -I "$TEST_DIR" Sources/UUDisplay/Config.swift \
-    Sources/UUDisplay/DisplayLayoutStability.swift Sources/UUDisplay/DisplayManager.swift \
+    Sources/UUDisplay/DisplayRecoveryPowerGuard.swift Sources/UUDisplay/DisplayLayoutStability.swift Sources/UUDisplay/DisplayManager.swift \
     tests/display-recovery-main.swift -o "$TEST_DIR/display-recovery-tests"
 "$TEST_DIR/display-recovery-tests"
